@@ -5,7 +5,7 @@
 Set these Vercel environment variables:
 
 ```bash
-VITE_API_BASE_URL=https://your-backend.example.com
+VITE_API_BASE_URL=https://floorplanapi.skylarenns.com
 VITE_GOOGLE_CLIENT_ID=your-google-web-client-id.apps.googleusercontent.com
 ```
 
@@ -21,9 +21,9 @@ Required backend variables:
 BIND_ADDR=0.0.0.0:8080
 DATABASE_URL=postgres://...
 ARTIFACT_DIR=/var/lib/glb-floorplan/artifacts
-PUBLIC_BASE_URL=https://your-backend.example.com
-FRONTEND_ORIGIN=https://your-vercel-app.vercel.app
-AUTH_ALLOWED_ORIGINS=https://your-vercel-app.vercel.app
+PUBLIC_BASE_URL=https://floorplanapi.skylarenns.com
+FRONTEND_ORIGIN=https://floorplan.skylarenns.com
+AUTH_ALLOWED_ORIGINS=https://floorplan.skylarenns.com
 AUTH_SECRET=<reuse or rotate from /home/skylarenns/.config/gmbl-auth.env>
 AUTH_COOKIE_NAME=glb_floorplan_session
 AUTH_SESSION_DAYS=30

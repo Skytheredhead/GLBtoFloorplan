@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!frontend/.env.production
 node_modules/
 dist/
 target/

@@ -27,7 +27,7 @@ services:
       DATABASE_URL: postgres://floorplan:floorplan@postgres:5432/floorplan
       ARTIFACT_DIR: /var/lib/glb-floorplan/artifacts
     ports:
-      - "8080:8080"
+      - "127.0.0.1:${BACKEND_HOST_PORT:-8080}:8080"
     volumes:
       - backend-artifacts:/var/lib/glb-floorplan/artifacts
 
