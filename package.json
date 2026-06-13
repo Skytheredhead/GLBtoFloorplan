@@ -1,0 +1,17 @@
+{
+  "name": "glb-to-floorplan",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "frontend"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace frontend",
+    "build": "npm run build --workspace frontend",
+    "preview": "npm run preview --workspace frontend",
+    "backend:dev": "cd backend && PATH=\"$HOME/.cargo/bin:$PATH\" cargo run",
+    "backend:test": "cd backend && PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+    "check": "npm run build && npm run backend:test"
+  }
+}
