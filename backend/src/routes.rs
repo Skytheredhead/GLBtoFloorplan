@@ -35,8 +35,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/floorplans/{id}", get(get_floorplan))
         .route("/api/floorplans/{id}/events", get(floorplan_events))
-        .route("/api/floorplans/{id}.svg", get(get_svg))
-        .route("/api/floorplans/{id}.pdf", get(get_pdf))
+        .route("/api/floorplans/{id}/svg", get(get_svg))
+        .route("/api/floorplans/{id}/pdf", get(get_pdf))
         .with_state(state)
 }
 
@@ -376,11 +376,11 @@ fn summary_from_row(row: FloorplanRow) -> FloorplanSummary {
     let svg_url = row
         .svg_path
         .as_ref()
-        .map(|_| format!("/api/floorplans/{}.svg", row.id));
+        .map(|_| format!("/api/floorplans/{}/svg", row.id));
     let pdf_url = row
         .pdf_path
         .as_ref()
-        .map(|_| format!("/api/floorplans/{}.pdf", row.id));
+        .map(|_| format!("/api/floorplans/{}/pdf", row.id));
 
     FloorplanSummary {
         id: row.id,
