@@ -1,8 +1,13 @@
-use std::{convert::Infallible, time::Duration};
+use std::{
+    convert::Infallible,
+    io::{Cursor, Read},
+    net::SocketAddr,
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
-    extract::{Multipart, Path, Query, State},
+    extract::{ConnectInfo, Multipart, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{
         IntoResponse, Response, Sse,
@@ -10,29 +15,24 @@ use axum::{
     },
     routing::{get, post},
 };
-use serde::Deserialize;
+use chrono::{Datelike, Days, NaiveDate, TimeZone, Utc};
 use uuid::Uuid;
+use zip::ZipArchive;
 
 use crate::{
-    AppState, auth,
+    AppState, DailyUsage,
     error::{ApiError, ApiResult},
     models::{
-        AuthResponse, FloorplanDetail, FloorplanRow, FloorplanSummary, GoogleAuthRequest,
-        JobSnapshot, MeResponse, ProcessingJobRow, PublicUser, UploadResponse,
+        FloorplanDetail, FloorplanRecord, FloorplanSummary, JobSnapshot, Quota, UploadResponse,
     },
     processing,
-    storage::sha256_hex,
 };
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/api/auth/google", post(google_auth))
-        .route("/api/me", get(me))
-        .route(
-            "/api/floorplans",
-            get(list_floorplans).post(upload_floorplan),
-        )
+        .route("/api/quota", get(get_quota))
+        .route("/api/floorplans", post(upload_floorplan))
         .route("/api/floorplans/{id}", get(get_floorplan))
         .route("/api/floorplans/{id}/events", get(floorplan_events))
         .route("/api/floorplans/{id}/svg", get(get_svg))
@@ -44,48 +44,20 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
-async fn google_auth(
+async fn get_quota(
     State(state): State<AppState>,
-    Json(body): Json<GoogleAuthRequest>,
-) -> ApiResult<Response> {
-    let google = auth::verify_google_id_token(&state, &body.id_token).await?;
-    let user = auth::upsert_user(&state, google).await?;
-    let quota = auth::quota_for_user(&state, user.id).await?;
-    let (token, expires_at) = auth::create_session(&state, user.id).await?;
-    let response = AuthResponse {
-        token: token.clone(),
-        user: PublicUser::from(user),
-        quota,
-    };
-
-    let mut res = Json(response).into_response();
-    res.headers_mut().insert(
-        header::SET_COOKIE,
-        auth::set_cookie_header(auth::auth_cookie(&state.config, &token, expires_at)),
-    );
-    Ok(res)
-}
-
-async fn me(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<MeResponse>> {
-    let user = auth::require_user_from_headers(&state, &headers).await?;
-    let quota = auth::quota_for_user(&state, user.id).await?;
-    Ok(Json(MeResponse {
-        user: user.into(),
-        quota,
-    }))
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Json<Quota> {
+    Json(quota_for_request(&state, &headers, addr).await)
 }
 
 async fn upload_floorplan(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     mut multipart: Multipart,
 ) -> ApiResult<Json<UploadResponse>> {
-    let user = auth::require_user_from_headers(&state, &headers).await?;
-    let quota = auth::quota_for_user(&state, user.id).await?;
-    if quota.remaining <= 0 {
-        return Err(ApiError::QuotaExceeded);
-    }
-
     let mut upload: Option<(String, Vec<u8>)> = None;
     while let Some(field) = multipart
         .next_field()
@@ -105,145 +77,196 @@ async fn upload_floorplan(
         }
     }
 
-    let Some((filename, bytes)) = upload else {
-        return Err(ApiError::BadRequest("missing GLB file field".to_owned()));
+    let Some((upload_filename, upload_bytes)) = upload else {
+        return Err(ApiError::BadRequest("missing model file field".to_owned()));
     };
 
-    if !filename.to_ascii_lowercase().ends_with(".glb")
-        && !filename.to_ascii_lowercase().ends_with(".gltf")
-    {
-        return Err(ApiError::BadRequest(
-            "file must be .glb or .gltf".to_owned(),
-        ));
-    }
-    if bytes.is_empty() {
+    if upload_bytes.is_empty() {
         return Err(ApiError::BadRequest("uploaded file is empty".to_owned()));
     }
     let max_bytes = state.config.max_upload_mb * 1024 * 1024;
-    if bytes.len() > max_bytes {
+    if upload_bytes.len() > max_bytes {
         return Err(ApiError::BadRequest(format!(
             "file exceeds {}MB upload limit",
             state.config.max_upload_mb
         )));
     }
+    let UploadedModel { filename, bytes } =
+        normalize_uploaded_model(upload_filename, upload_bytes, max_bytes)?;
 
+    let quota = consume_quota(&state, &headers, addr).await?;
     let floorplan_id = Uuid::new_v4();
-    let source = state.store.put(floorplan_id, "source.glb", &bytes).await?;
-    let source_hash = sha256_hex(&bytes);
-    let title = filename
-        .trim_end_matches(".glb")
-        .trim_end_matches(".gltf")
-        .replace(['_', '-'], " ");
+    let title = title_from_model_filename(&filename);
+    let created_at = Utc::now();
+    let floorplan = FloorplanSummary {
+        id: floorplan_id,
+        title: if title.trim().is_empty() {
+            "New Floorplan".to_owned()
+        } else {
+            title
+        },
+        status: "queued".to_owned(),
+        source_filename: filename,
+        source_size_bytes: bytes.len() as i64,
+        confidence: 0.0,
+        total_area_sqft: None,
+        width_ft: None,
+        depth_ft: None,
+        failure_reason: None,
+        created_at,
+        svg_url: None,
+        pdf_url: None,
+    };
+    let job = JobSnapshot {
+        floorplan_id,
+        status: "queued".to_owned(),
+        progress: 0,
+        step: "Queued".to_owned(),
+        error: None,
+    };
 
-    let mut tx = state.pool.begin().await?;
-    let row = sqlx::query_as::<_, FloorplanRow>(
-        r#"
-        INSERT INTO floorplans (
-          id, user_id, title, status, source_filename, source_size_bytes,
-          source_sha256, source_artifact_path
-        )
-        VALUES ($1, $2, $3, 'processing', $4, $5, $6, $7)
-        RETURNING id, user_id, title, status, source_filename, source_size_bytes,
-          source_sha256, source_artifact_path, floorplan_json_path, svg_path, pdf_path,
-          thumbnail_path, confidence, total_area_sqft, width_ft, depth_ft, failure_reason,
-          created_at, updated_at
-        "#,
-    )
-    .bind(floorplan_id)
-    .bind(user.id)
-    .bind(if title.trim().is_empty() {
-        "New Floorplan".to_owned()
-    } else {
-        title
-    })
-    .bind(&filename)
-    .bind(bytes.len() as i64)
-    .bind(source_hash)
-    .bind(source.relative_path)
-    .fetch_one(&mut *tx)
-    .await?;
-
-    let job = sqlx::query_as::<_, ProcessingJobRow>(
-        r#"
-        INSERT INTO processing_jobs (id, floorplan_id, status, progress, step)
-        VALUES ($1, $2, 'queued', 0, 'Queued')
-        RETURNING id, floorplan_id, status, progress, step, error, created_at, updated_at
-        "#,
-    )
-    .bind(Uuid::new_v4())
-    .bind(floorplan_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    tx.commit().await?;
+    state.jobs.write().await.insert(
+        floorplan_id,
+        FloorplanRecord {
+            summary: floorplan.clone(),
+            job: job.clone(),
+            svg: None,
+            pdf: None,
+        },
+    );
 
     tokio::spawn(processing::process_floorplan(
         state.clone(),
         floorplan_id,
-        user.id,
+        bytes,
     ));
 
     Ok(Json(UploadResponse {
-        floorplan: summary_from_row(row),
-        job: snapshot_from_job(job),
-    }))
-}
-
-async fn list_floorplans(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Vec<FloorplanSummary>>> {
-    let user = auth::require_user_from_headers(&state, &headers).await?;
-    let rows = sqlx::query_as::<_, FloorplanRow>(
-        r#"
-        SELECT id, user_id, title, status, source_filename, source_size_bytes,
-          source_sha256, source_artifact_path, floorplan_json_path, svg_path, pdf_path,
-          thumbnail_path, confidence, total_area_sqft, width_ft, depth_ft, failure_reason,
-          created_at, updated_at
-        FROM floorplans
-        WHERE user_id = $1
-        ORDER BY created_at DESC
-        LIMIT 50
-        "#,
-    )
-    .bind(user.id)
-    .fetch_all(&state.pool)
-    .await?;
-
-    Ok(Json(rows.into_iter().map(summary_from_row).collect()))
-}
-
-async fn get_floorplan(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<FloorplanDetail>> {
-    let user = auth::require_user_from_headers(&state, &headers).await?;
-    let row = load_floorplan(&state, user.id, id).await?;
-    let job = load_job(&state, id).await.ok();
-    Ok(Json(FloorplanDetail {
-        floorplan: summary_from_row(row),
+        floorplan,
         job,
+        quota,
     }))
 }
 
-#[derive(Debug, Deserialize)]
-struct TokenQuery {
-    token: Option<String>,
+#[derive(Debug)]
+struct UploadedModel {
+    filename: String,
+    bytes: Vec<u8>,
+}
+
+fn normalize_uploaded_model(
+    filename: String,
+    bytes: Vec<u8>,
+    max_bytes: usize,
+) -> ApiResult<UploadedModel> {
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".glb") || lower.ends_with(".gltf") {
+        return Ok(UploadedModel { filename, bytes });
+    }
+    if lower.ends_with(".zip") {
+        return extract_model_from_zip(&filename, bytes, max_bytes);
+    }
+
+    Err(ApiError::BadRequest(
+        "file must be .glb, .gltf, or a .zip containing one".to_owned(),
+    ))
+}
+
+fn extract_model_from_zip(
+    archive_filename: &str,
+    bytes: Vec<u8>,
+    max_bytes: usize,
+) -> ApiResult<UploadedModel> {
+    let cursor = Cursor::new(bytes);
+    let mut archive = ZipArchive::new(cursor)
+        .map_err(|err| ApiError::BadRequest(format!("could not read zip archive: {err}")))?;
+    let mut gltf_candidate: Option<UploadedModel> = None;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|err| ApiError::BadRequest(format!("could not read zip entry: {err}")))?;
+        if entry.is_dir() {
+            continue;
+        }
+
+        let entry_name = entry.name().to_owned();
+        let lower = entry_name.to_ascii_lowercase();
+        if lower.starts_with("__macosx/") || lower.contains("/__macosx/") {
+            continue;
+        }
+        if !lower.ends_with(".glb") && !lower.ends_with(".gltf") {
+            continue;
+        }
+
+        let mut extracted = Vec::new();
+        entry
+            .by_ref()
+            .take((max_bytes + 1) as u64)
+            .read_to_end(&mut extracted)
+            .map_err(|err| {
+                ApiError::BadRequest(format!("could not extract model from zip: {err}"))
+            })?;
+        if extracted.len() > max_bytes {
+            return Err(ApiError::BadRequest(format!(
+                "model inside zip exceeds {}MB upload limit",
+                max_bytes / 1024 / 1024
+            )));
+        }
+        if extracted.is_empty() {
+            return Err(ApiError::BadRequest(format!(
+                "model inside zip is empty: {entry_name}"
+            )));
+        }
+
+        let filename = format!("{archive_filename}: {entry_name}");
+        let model = UploadedModel {
+            filename,
+            bytes: extracted,
+        };
+        if lower.ends_with(".glb") {
+            return Ok(model);
+        }
+        gltf_candidate = Some(model);
+    }
+
+    gltf_candidate.ok_or_else(|| {
+        ApiError::BadRequest("zip archive did not contain a .glb or .gltf file".to_owned())
+    })
+}
+
+fn title_from_model_filename(filename: &str) -> String {
+    let model_name = filename
+        .rsplit_once(": ")
+        .map(|(_, inner)| inner)
+        .unwrap_or(filename)
+        .rsplit('/')
+        .next()
+        .unwrap_or(filename);
+    let lower = model_name.to_ascii_lowercase();
+    let stem = if lower.ends_with(".glb") || lower.ends_with(".zip") {
+        &model_name[..model_name.len().saturating_sub(4)]
+    } else if lower.ends_with(".gltf") {
+        &model_name[..model_name.len().saturating_sub(5)]
+    } else {
+        model_name
+    };
+    stem.replace(['_', '-'], " ")
 }
 
 async fn floorplan_events(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<Uuid>,
-    Query(query): Query<TokenQuery>,
 ) -> ApiResult<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>> {
-    let user = auth_from_headers_or_query(&state, &headers, query.token.as_deref()).await?;
-    let _ = load_floorplan(&state, user.id, id).await?;
+    if load_record(&state, id).await.is_none() {
+        return Err(ApiError::NotFound);
+    }
 
     let stream = async_stream::stream! {
         loop {
-            match load_job(&state, id).await {
-                Ok(snapshot) => {
+            match load_record(&state, id).await {
+                Some(record) => {
+                    let snapshot = record.job;
                     let terminal = snapshot.status == "complete" || snapshot.status == "failed";
                     let event = Event::default()
                         .event("progress")
@@ -254,7 +277,7 @@ async fn floorplan_events(
                         break;
                     }
                 }
-                Err(_) => {
+                None => {
                     yield Ok(Event::default().event("error").data("job not found"));
                     break;
                 }
@@ -266,135 +289,158 @@ async fn floorplan_events(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-async fn get_svg(
+async fn get_floorplan(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<Uuid>,
-    Query(query): Query<TokenQuery>,
-) -> ApiResult<Response> {
-    let user = auth_from_headers_or_query(&state, &headers, query.token.as_deref()).await?;
-    let row = load_floorplan(&state, user.id, id).await?;
-    let path = row.svg_path.ok_or(ApiError::NotFound)?;
-    artifact_response(&state, &path, "image/svg+xml", None).await
+) -> ApiResult<Json<FloorplanDetail>> {
+    let record = load_record(&state, id).await.ok_or(ApiError::NotFound)?;
+    Ok(Json(FloorplanDetail {
+        floorplan: record.summary,
+        job: Some(record.job),
+    }))
 }
 
-async fn get_pdf(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-    Query(query): Query<TokenQuery>,
-) -> ApiResult<Response> {
-    let user = auth_from_headers_or_query(&state, &headers, query.token.as_deref()).await?;
-    let row = load_floorplan(&state, user.id, id).await?;
-    let path = row.pdf_path.ok_or(ApiError::NotFound)?;
-    artifact_response(
-        &state,
-        &path,
-        "application/pdf",
-        Some(format!("{}.pdf", row.title.replace('/', "-"))),
-    )
-    .await
-}
-
-async fn artifact_response(
-    state: &AppState,
-    path: &str,
-    content_type: &'static str,
-    filename: Option<String>,
-) -> ApiResult<Response> {
-    let bytes = state.store.read(path).await?;
-    let mut response = (StatusCode::OK, bytes).into_response();
+async fn get_svg(State(state): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<Response> {
+    let record = load_record(&state, id).await.ok_or(ApiError::NotFound)?;
+    let svg = record.svg.ok_or(ApiError::NotFound)?;
+    let mut response = (StatusCode::OK, svg).into_response();
     response
         .headers_mut()
-        .insert(header::CONTENT_TYPE, content_type.parse().unwrap());
-    if let Some(filename) = filename {
-        response.headers_mut().insert(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", filename.replace('"', ""))
-                .parse()
-                .unwrap(),
-        );
-    }
+        .insert(header::CONTENT_TYPE, "image/svg+xml".parse().unwrap());
     Ok(response)
 }
 
-async fn auth_from_headers_or_query(
+async fn get_pdf(State(state): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<Response> {
+    let record = load_record(&state, id).await.ok_or(ApiError::NotFound)?;
+    let pdf = record.pdf.ok_or(ApiError::NotFound)?;
+    let mut response = (StatusCode::OK, pdf).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, "application/pdf".parse().unwrap());
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        format!(
+            "attachment; filename=\"{}.pdf\"",
+            record.summary.title.replace(['/', '"'], "-")
+        )
+        .parse()
+        .unwrap(),
+    );
+    Ok(response)
+}
+
+async fn load_record(state: &AppState, id: Uuid) -> Option<FloorplanRecord> {
+    state.jobs.read().await.get(&id).cloned()
+}
+
+async fn quota_for_request(state: &AppState, headers: &HeaderMap, addr: SocketAddr) -> Quota {
+    let ip = client_ip(headers, addr);
+    let today = Utc::now().date_naive();
+    let usage = state.usage.lock().await;
+    let used = usage
+        .get(&ip)
+        .filter(|entry| entry.day == today)
+        .map(|entry| entry.used)
+        .unwrap_or(0);
+    quota_from_used(state, today, used)
+}
+
+async fn consume_quota(
     state: &AppState,
     headers: &HeaderMap,
-    query_token: Option<&str>,
-) -> ApiResult<crate::models::User> {
-    if let Some(token) = query_token.filter(|t| !t.is_empty()) {
-        return auth::require_user_from_token(state, token).await;
+    addr: SocketAddr,
+) -> ApiResult<Quota> {
+    let ip = client_ip(headers, addr);
+    let today = Utc::now().date_naive();
+    let mut usage = state.usage.lock().await;
+    let entry = usage.entry(ip).or_insert(DailyUsage {
+        day: today,
+        used: 0,
+    });
+    if entry.day != today {
+        entry.day = today;
+        entry.used = 0;
     }
-    auth::require_user_from_headers(state, headers).await
+    if entry.used >= state.config.daily_ip_converts {
+        return Err(ApiError::QuotaExceeded);
+    }
+    entry.used += 1;
+    Ok(quota_from_used(state, today, entry.used))
 }
 
-async fn load_floorplan(state: &AppState, user_id: Uuid, id: Uuid) -> ApiResult<FloorplanRow> {
-    sqlx::query_as::<_, FloorplanRow>(
-        r#"
-        SELECT id, user_id, title, status, source_filename, source_size_bytes,
-          source_sha256, source_artifact_path, floorplan_json_path, svg_path, pdf_path,
-          thumbnail_path, confidence, total_area_sqft, width_ft, depth_ft, failure_reason,
-          created_at, updated_at
-        FROM floorplans
-        WHERE id = $1 AND user_id = $2
-        "#,
-    )
-    .bind(id)
-    .bind(user_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(ApiError::NotFound)
-}
-
-async fn load_job(state: &AppState, floorplan_id: Uuid) -> ApiResult<JobSnapshot> {
-    let row = sqlx::query_as::<_, ProcessingJobRow>(
-        r#"
-        SELECT id, floorplan_id, status, progress, step, error, created_at, updated_at
-        FROM processing_jobs
-        WHERE floorplan_id = $1
-        "#,
-    )
-    .bind(floorplan_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(ApiError::NotFound)?;
-    Ok(snapshot_from_job(row))
-}
-
-fn snapshot_from_job(row: ProcessingJobRow) -> JobSnapshot {
-    JobSnapshot {
-        floorplan_id: row.floorplan_id,
-        status: row.status,
-        progress: row.progress,
-        step: row.step,
-        error: row.error,
+fn quota_from_used(state: &AppState, day: NaiveDate, used: i64) -> Quota {
+    let daily_limit = state.config.daily_ip_converts;
+    Quota {
+        daily_limit,
+        used,
+        remaining: (daily_limit - used).max(0),
+        day,
+        reset_at: next_day_start_utc(day),
     }
 }
 
-fn summary_from_row(row: FloorplanRow) -> FloorplanSummary {
-    let svg_url = row
-        .svg_path
-        .as_ref()
-        .map(|_| format!("/api/floorplans/{}/svg", row.id));
-    let pdf_url = row
-        .pdf_path
-        .as_ref()
-        .map(|_| format!("/api/floorplans/{}/pdf", row.id));
+fn next_day_start_utc(day: NaiveDate) -> chrono::DateTime<Utc> {
+    let next = day.checked_add_days(Days::new(1)).expect("valid next day");
+    Utc.with_ymd_and_hms(next.year(), next.month(), next.day(), 0, 0, 0)
+        .single()
+        .expect("valid date")
+}
 
-    FloorplanSummary {
-        id: row.id,
-        title: row.title,
-        status: row.status,
-        source_filename: row.source_filename,
-        source_size_bytes: row.source_size_bytes,
-        confidence: row.confidence,
-        total_area_sqft: row.total_area_sqft,
-        width_ft: row.width_ft,
-        depth_ft: row.depth_ft,
-        failure_reason: row.failure_reason,
-        created_at: row.created_at,
-        svg_url,
-        pdf_url,
+fn client_ip(headers: &HeaderMap, addr: SocketAddr) -> String {
+    for header_name in ["x-forwarded-for", "x-real-ip", "cf-connecting-ip"] {
+        if let Some(value) = headers.get(header_name).and_then(|v| v.to_str().ok()) {
+            if let Some(ip) = value
+                .split(',')
+                .next()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                return ip.to_owned();
+            }
+        }
+    }
+    addr.ip().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::{ZipWriter, write::SimpleFileOptions};
+
+    #[test]
+    fn extracts_nested_glb_from_zip() {
+        let zip_bytes = zip_with_files(&[
+            ("assets/readme.txt", b"ignore me".as_slice()),
+            ("models/apartment.glb", b"glb bytes".as_slice()),
+        ]);
+
+        let model =
+            normalize_uploaded_model("scan.zip".to_owned(), zip_bytes, 1024).expect("valid model");
+
+        assert_eq!(model.filename, "scan.zip: models/apartment.glb");
+        assert_eq!(model.bytes, b"glb bytes");
+    }
+
+    #[test]
+    fn rejects_zip_without_model() {
+        let zip_bytes = zip_with_files(&[("assets/readme.txt", b"ignore me".as_slice())]);
+
+        let err = normalize_uploaded_model("scan.zip".to_owned(), zip_bytes, 1024)
+            .expect_err("zip should not contain a model");
+
+        assert!(err.to_string().contains("did not contain a .glb or .gltf"));
+    }
+
+    fn zip_with_files(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = ZipWriter::new(cursor);
+        for (name, bytes) in files {
+            writer
+                .start_file(*name, SimpleFileOptions::default())
+                .expect("start zip file");
+            writer.write_all(bytes).expect("write zip file");
+        }
+        writer.finish().expect("finish zip").into_inner()
     }
 }

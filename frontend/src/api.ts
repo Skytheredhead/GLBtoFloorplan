@@ -1,13 +1,11 @@
 import type {
-  AuthResponse,
   FloorplanDetail,
-  FloorplanSummary,
-  MeResponse,
+  Quota,
   UploadResponse,
 } from "./types";
 
 export const API_BASE = (
-  import.meta.env.VITE_API_BASE_URL || "https://floorplanapi.skylarenns.com"
+  import.meta.env.VITE_API_BASE_URL || "http://localhost:8080"
 ).replace(/\/$/, "");
 
 export class ApiError extends Error {
@@ -22,12 +20,8 @@ export class ApiError extends Error {
 async function request<T>(
   path: string,
   options: RequestInit = {},
-  token?: string | null,
 ): Promise<T> {
   const headers = new Headers(options.headers);
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
-  }
   if (!(options.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
@@ -52,26 +46,15 @@ async function request<T>(
   return response.json() as Promise<T>;
 }
 
-export function loginWithGoogle(idToken: string) {
-  return request<AuthResponse>("/api/auth/google", {
-    method: "POST",
-    body: JSON.stringify({ id_token: idToken }),
-  });
+export function getQuota() {
+  return request<Quota>("/api/quota");
 }
 
-export function getMe(token: string) {
-  return request<MeResponse>("/api/me", {}, token);
+export function getFloorplan(id: string) {
+  return request<FloorplanDetail>(`/api/floorplans/${id}`);
 }
 
-export function listFloorplans(token: string) {
-  return request<FloorplanSummary[]>("/api/floorplans", {}, token);
-}
-
-export function getFloorplan(token: string, id: string) {
-  return request<FloorplanDetail>(`/api/floorplans/${id}`, {}, token);
-}
-
-export function uploadFloorplan(token: string, file: File) {
+export function uploadFloorplan(file: File) {
   const form = new FormData();
   form.append("file", file);
   return request<UploadResponse>(
@@ -80,12 +63,10 @@ export function uploadFloorplan(token: string, file: File) {
       method: "POST",
       body: form,
     },
-    token,
   );
 }
 
-export function withToken(path: string | undefined, token: string | null) {
-  if (!path || !token) return undefined;
-  const separator = path.includes("?") ? "&" : "?";
-  return `${API_BASE}${path}${separator}token=${encodeURIComponent(token)}`;
+export function apiUrl(path: string | undefined) {
+  if (!path) return undefined;
+  return `${API_BASE}${path}`;
 }

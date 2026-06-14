@@ -5,7 +5,7 @@ pub mod render;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AppState, auth, storage};
+use crate::{AppState, models::FloorplanRecord};
 
 pub const METERS_TO_FEET: f64 = 3.280_839_895;
 
@@ -81,26 +81,19 @@ pub struct Dimension {
     pub offset_ft: f64,
 }
 
-pub async fn process_floorplan(state: AppState, floorplan_id: Uuid, user_id: Uuid) {
-    if let Err(err) = process_floorplan_inner(&state, floorplan_id, user_id).await {
+pub async fn process_floorplan(state: AppState, floorplan_id: Uuid, source_bytes: Vec<u8>) {
+    if let Err(err) = process_floorplan_inner(&state, floorplan_id, source_bytes).await {
         tracing::error!(%floorplan_id, error = %err, "floorplan processing failed");
-        let _ = mark_failed(&state, floorplan_id, &err.to_string()).await;
+        mark_failed(&state, floorplan_id, &err.to_string()).await;
     }
 }
 
 async fn process_floorplan_inner(
     state: &AppState,
     floorplan_id: Uuid,
-    user_id: Uuid,
+    source_bytes: Vec<u8>,
 ) -> anyhow::Result<()> {
-    update_job(state, floorplan_id, "processing", 8, "Loading GLB").await?;
-
-    let source_path: String =
-        sqlx::query_scalar("SELECT source_artifact_path FROM floorplans WHERE id = $1")
-            .bind(floorplan_id)
-            .fetch_one(&state.pool)
-            .await?;
-    let source_bytes = state.store.read(&source_path).await?;
+    update_job(state, floorplan_id, "processing", 8, "Loading GLB").await;
 
     update_job(
         state,
@@ -109,7 +102,7 @@ async fn process_floorplan_inner(
         24,
         "Analyzing 3D geometry",
     )
-    .await?;
+    .await;
     let scan = gltf_import::scan_glb(&source_bytes)?;
 
     update_job(
@@ -119,7 +112,7 @@ async fn process_floorplan_inner(
         46,
         "Detecting rooms and openings",
     )
-    .await?;
+    .await;
     let document = geometry::build_floorplan(floorplan_id, scan)?;
 
     update_job(
@@ -129,8 +122,7 @@ async fn process_floorplan_inner(
         64,
         "Calculating measurements",
     )
-    .await?;
-    let json = serde_json::to_vec_pretty(&document)?;
+    .await;
     let svg = render::render_svg(&document);
 
     update_job(
@@ -140,183 +132,50 @@ async fn process_floorplan_inner(
         82,
         "Generating floorplan PDF",
     )
-    .await?;
+    .await;
     let pdf = render::render_pdf(&document);
 
-    let json_artifact = state
-        .store
-        .put(floorplan_id, "floorplan.json", &json)
-        .await?;
-    let svg_artifact = state
-        .store
-        .put(floorplan_id, "floorplan.svg", svg.as_bytes())
-        .await?;
-    let pdf_artifact = state.store.put(floorplan_id, "floorplan.pdf", &pdf).await?;
-    let thumb_artifact = state
-        .store
-        .put(floorplan_id, "thumbnail.svg", svg.as_bytes())
-        .await?;
-
-    insert_artifact(
-        state,
-        floorplan_id,
-        "json",
-        "application/json",
-        &json_artifact,
-    )
-    .await?;
-    insert_artifact(state, floorplan_id, "svg", "image/svg+xml", &svg_artifact).await?;
-    insert_artifact(state, floorplan_id, "pdf", "application/pdf", &pdf_artifact).await?;
-    insert_artifact(
-        state,
-        floorplan_id,
-        "thumbnail",
-        "image/svg+xml",
-        &thumb_artifact,
-    )
-    .await?;
-
-    let month_start = auth::current_month_start();
-    let mut tx = state.pool.begin().await?;
-    sqlx::query(
-        r#"
-        UPDATE floorplans
-        SET status = 'complete',
-            floorplan_json_path = $2,
-            svg_path = $3,
-            pdf_path = $4,
-            thumbnail_path = $5,
-            confidence = $6,
-            total_area_sqft = $7,
-            width_ft = $8,
-            depth_ft = $9,
-            failure_reason = NULL,
-            updated_at = now()
-        WHERE id = $1 AND user_id = $10
-        "#,
-    )
-    .bind(floorplan_id)
-    .bind(json_artifact.relative_path)
-    .bind(svg_artifact.relative_path)
-    .bind(pdf_artifact.relative_path)
-    .bind(thumb_artifact.relative_path)
-    .bind(document.confidence)
-    .bind(document.total_area_sqft)
-    .bind(document.width_ft)
-    .bind(document.depth_ft)
-    .bind(user_id)
-    .execute(&mut *tx)
-    .await?;
-
-    sqlx::query(
-        r#"
-        INSERT INTO monthly_save_events (id, user_id, floorplan_id, month_start)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (floorplan_id) DO NOTHING
-        "#,
-    )
-    .bind(Uuid::new_v4())
-    .bind(user_id)
-    .bind(floorplan_id)
-    .bind(month_start)
-    .execute(&mut *tx)
-    .await?;
-
-    sqlx::query(
-        r#"
-        UPDATE processing_jobs
-        SET status = 'complete',
-            progress = 100,
-            step = 'Floorplan ready',
-            error = NULL,
-            updated_at = now()
-        WHERE floorplan_id = $1
-        "#,
-    )
-    .bind(floorplan_id)
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-    Ok(())
-}
-
-async fn update_job(
-    state: &AppState,
-    floorplan_id: Uuid,
-    status: &str,
-    progress: i32,
-    step: &str,
-) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"
-        UPDATE processing_jobs
-        SET status = $2, progress = $3, step = $4, error = NULL, updated_at = now()
-        WHERE floorplan_id = $1
-        "#,
-    )
-    .bind(floorplan_id)
-    .bind(status)
-    .bind(progress)
-    .bind(step)
-    .execute(&state.pool)
-    .await?;
+    let mut jobs = state.jobs.write().await;
+    if let Some(record) = jobs.get_mut(&floorplan_id) {
+        record.summary.status = "complete".to_owned();
+        record.summary.confidence = document.confidence;
+        record.summary.total_area_sqft = Some(document.total_area_sqft);
+        record.summary.width_ft = Some(document.width_ft);
+        record.summary.depth_ft = Some(document.depth_ft);
+        record.summary.failure_reason = None;
+        record.summary.svg_url = Some(format!("/api/floorplans/{floorplan_id}/svg"));
+        record.summary.pdf_url = Some(format!("/api/floorplans/{floorplan_id}/pdf"));
+        record.job.status = "complete".to_owned();
+        record.job.progress = 100;
+        record.job.step = "Floorplan ready".to_owned();
+        record.job.error = None;
+        record.svg = Some(svg);
+        record.pdf = Some(pdf);
+    }
 
     Ok(())
 }
 
-async fn mark_failed(state: &AppState, floorplan_id: Uuid, message: &str) -> anyhow::Result<()> {
+async fn update_job(state: &AppState, floorplan_id: Uuid, status: &str, progress: i32, step: &str) {
+    let mut jobs = state.jobs.write().await;
+    if let Some(record) = jobs.get_mut(&floorplan_id) {
+        record.summary.status = status.to_owned();
+        record.job.status = status.to_owned();
+        record.job.progress = progress;
+        record.job.step = step.to_owned();
+        record.job.error = None;
+    }
+}
+
+async fn mark_failed(state: &AppState, floorplan_id: Uuid, message: &str) {
     let message = message.chars().take(800).collect::<String>();
-    let mut tx = state.pool.begin().await?;
-    sqlx::query(
-        r#"
-        UPDATE floorplans
-        SET status = 'failed', failure_reason = $2, updated_at = now()
-        WHERE id = $1
-        "#,
-    )
-    .bind(floorplan_id)
-    .bind(&message)
-    .execute(&mut *tx)
-    .await?;
-
-    sqlx::query(
-        r#"
-        UPDATE processing_jobs
-        SET status = 'failed', progress = 100, step = 'Processing failed', error = $2, updated_at = now()
-        WHERE floorplan_id = $1
-        "#,
-    )
-    .bind(floorplan_id)
-    .bind(&message)
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-    Ok(())
-}
-
-async fn insert_artifact(
-    state: &AppState,
-    floorplan_id: Uuid,
-    kind: &str,
-    content_type: &str,
-    artifact: &storage::StoredArtifact,
-) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO artifact_objects (id, floorplan_id, kind, path, content_type, size_bytes, sha256)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        "#,
-    )
-    .bind(Uuid::new_v4())
-    .bind(floorplan_id)
-    .bind(kind)
-    .bind(&artifact.relative_path)
-    .bind(content_type)
-    .bind(artifact.size_bytes)
-    .bind(&artifact.sha256)
-    .execute(&state.pool)
-    .await?;
-    Ok(())
+    let mut jobs = state.jobs.write().await;
+    if let Some(FloorplanRecord { summary, job, .. }) = jobs.get_mut(&floorplan_id) {
+        summary.status = "failed".to_owned();
+        summary.failure_reason = Some(message.clone());
+        job.status = "failed".to_owned();
+        job.progress = 100;
+        job.step = "Processing failed".to_owned();
+        job.error = Some(message);
+    }
 }

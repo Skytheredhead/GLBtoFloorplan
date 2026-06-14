@@ -1,52 +1,36 @@
 import {
   AlertCircle,
-  BarChart3,
   Box,
   CheckCircle2,
   Download,
   FileArchive,
   FileText,
-  Folder,
   HelpCircle,
   Home,
   LoaderCircle,
-  LogOut,
-  Menu,
   MoreHorizontal,
   Upload,
-  User,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   API_BASE,
   ApiError,
+  apiUrl,
   getFloorplan,
-  getMe,
-  listFloorplans,
-  loginWithGoogle,
+  getQuota,
   uploadFloorplan,
-  withToken,
 } from "./api";
 import type {
   FloorplanDetail,
   FloorplanSummary,
   JobSnapshot,
-  MeResponse,
-  PublicUser,
   Quota,
 } from "./types";
 
-const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
-const TOKEN_KEY = "glb-floorplan-token";
-
 function App() {
-  const [token, setToken] = useState<string | null>(() =>
-    localStorage.getItem(TOKEN_KEY),
-  );
-  const [user, setUser] = useState<PublicUser | null>(null);
   const [quota, setQuota] = useState<Quota | null>(null);
-  const [floorplans, setFloorplans] = useState<FloorplanSummary[]>([]);
+  const [recentFloorplans, setRecentFloorplans] = useState<FloorplanSummary[]>([]);
   const [active, setActive] = useState<FloorplanSummary | null>(null);
   const [job, setJob] = useState<JobSnapshot | null>(null);
   const [isDragging, setDragging] = useState(false);
@@ -54,51 +38,36 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const refreshAccount = useCallback(
-    async (authToken = token) => {
-      if (!authToken) return;
-      const [me, saved] = await Promise.all([
-        getMe(authToken),
-        listFloorplans(authToken),
-      ]);
-      setUser(me.user);
-      setQuota(me.quota);
-      setFloorplans(saved);
-      setActive((current) => current ?? saved[0] ?? null);
-    },
-    [token],
-  );
+  const refreshQuota = useCallback(async () => {
+    setQuota(await getQuota());
+  }, []);
 
   useEffect(() => {
-    if (!token) return;
-    refreshAccount(token).catch((err) => {
-      console.error(err);
-      localStorage.removeItem(TOKEN_KEY);
-      setToken(null);
-    });
-  }, [refreshAccount, token]);
+    refreshQuota().catch((err) => setError(messageForError(err)));
+  }, [refreshQuota]);
 
   useEffect(() => {
-    if (!token || !active || active.status === "complete" || active.status === "failed") {
+    if (!active || active.status === "complete" || active.status === "failed") {
       return;
     }
 
-    const events = new EventSource(
-      `${API_BASE}/api/floorplans/${active.id}/events?token=${encodeURIComponent(
-        token,
-      )}`,
-    );
+    const events = new EventSource(`${API_BASE}/api/floorplans/${active.id}/events`);
 
     events.addEventListener("progress", (event) => {
       const snapshot = JSON.parse((event as MessageEvent).data) as JobSnapshot;
       setJob(snapshot);
       if (snapshot.status === "complete" || snapshot.status === "failed") {
         events.close();
-        getFloorplan(token, active.id)
+        getFloorplan(active.id)
           .then((detail: FloorplanDetail) => {
             setActive(detail.floorplan);
             setJob(detail.job ?? snapshot);
-            return refreshAccount(token);
+            setRecentFloorplans((items) =>
+              [detail.floorplan, ...items.filter((item) => item.id !== detail.floorplan.id)].slice(
+                0,
+                5,
+              ),
+            );
           })
           .catch((err) => setError(messageForError(err)));
       }
@@ -106,45 +75,27 @@ function App() {
 
     events.onerror = () => {
       events.close();
-      pollFloorplan(token, active.id, setActive, setJob, refreshAccount).catch(
-        (err) => setError(messageForError(err)),
+      pollFloorplan(active.id, setActive, setJob).catch((err) =>
+        setError(messageForError(err)),
       );
     };
 
     return () => events.close();
-  }, [active, refreshAccount, token]);
-
-  const signIn = async (idToken: string) => {
-    setError(null);
-    const response = await loginWithGoogle(idToken);
-    localStorage.setItem(TOKEN_KEY, response.token);
-    setToken(response.token);
-    setUser(response.user);
-    setQuota(response.quota);
-    await refreshAccount(response.token);
-  };
-
-  const signOut = () => {
-    localStorage.removeItem(TOKEN_KEY);
-    setToken(null);
-    setUser(null);
-    setQuota(null);
-    setFloorplans([]);
-    setActive(null);
-    setJob(null);
-  };
+  }, [active]);
 
   const handleFile = async (file: File) => {
-    if (!token || isUploading) return;
+    if (isUploading) return;
     setError(null);
     setUploading(true);
     try {
-      const response = await uploadFloorplan(token, file);
+      const response = await uploadFloorplan(file);
+      setQuota(response.quota);
       setActive(response.floorplan);
       setJob(response.job);
-      setFloorplans((items) => [response.floorplan, ...items]);
+      setRecentFloorplans((items) => [response.floorplan, ...items].slice(0, 5));
     } catch (err) {
       setError(messageForError(err));
+      refreshQuota().catch(() => undefined);
     } finally {
       setUploading(false);
     }
@@ -156,10 +107,6 @@ function App() {
     return 1;
   }, [active]);
 
-  if (!token || !user || !quota) {
-    return <SignInScreen onSignIn={signIn} error={error} setError={setError} />;
-  }
-
   return (
     <div className="app-shell">
       <aside className="sidebar" aria-label="Main">
@@ -168,40 +115,24 @@ function App() {
           <span>New Floorplan</span>
         </button>
         <button className="nav-item" type="button">
-          <Folder size={19} />
-          <span>My Floorplans</span>
-        </button>
-        <button className="nav-item" type="button">
-          <User size={19} />
-          <span>Account</span>
-        </button>
-        <button className="nav-item" type="button">
-          <BarChart3 size={19} />
-          <span>Usage</span>
-        </button>
-        <button className="nav-item signout" type="button" onClick={signOut}>
-          <LogOut size={19} />
-          <span>Sign out</span>
+          <FileText size={19} />
+          <span>Recent</span>
         </button>
       </aside>
 
       <main className="workspace">
         <header className="topbar">
           <div className="brand">
-            <Menu className="mobile-menu" size={21} />
-            <Home size={19} />
+            <Box size={19} />
             <strong>GLB to Floorplan</strong>
           </div>
           <div className="topbar-actions">
             <span className="quota">
-              <b>{quota.remaining}</b> / {quota.monthly_limit} free saves this
-              month
+              <b>{quota?.remaining ?? "-"}</b> / {quota?.daily_limit ?? 5} converts
+              left today
             </span>
             <button className="icon-button" type="button" aria-label="Help">
               <HelpCircle size={19} />
-            </button>
-            <button className="avatar" type="button" title={user.email}>
-              {(user.name || user.email).slice(0, 1).toUpperCase()}
             </button>
           </div>
         </header>
@@ -221,9 +152,8 @@ function App() {
             currentStep={currentStep}
             active={active}
             job={job}
-            floorplans={floorplans}
+            floorplans={recentFloorplans}
             onPick={setActive}
-            token={token}
           />
 
           <section className="canvas-region">
@@ -243,9 +173,7 @@ function App() {
               />
             )}
 
-            {currentStep === 3 && active && (
-              <ResultView floorplan={active} token={token} />
-            )}
+            {currentStep === 3 && active && <ResultView floorplan={active} />}
 
             {active?.status === "failed" && (
               <FailedView
@@ -263,115 +191,27 @@ function App() {
   );
 }
 
-function SignInScreen({
-  onSignIn,
-  error,
-  setError,
-}: {
-  onSignIn: (idToken: string) => Promise<void>;
-  error: string | null;
-  setError: (value: string | null) => void;
-}) {
-  const googleButtonRef = useRef<HTMLDivElement>(null);
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    if (!GOOGLE_CLIENT_ID || !googleButtonRef.current) return;
-
-    const render = () => {
-      if (!window.google || !googleButtonRef.current) return;
-      window.google.accounts.id.initialize({
-        client_id: GOOGLE_CLIENT_ID,
-        callback: (response) => {
-          setBusy(true);
-          onSignIn(response.credential)
-            .catch((err) => setError(messageForError(err)))
-            .finally(() => setBusy(false));
-        },
-      });
-      window.google.accounts.id.renderButton(googleButtonRef.current, {
-        theme: "outline",
-        size: "large",
-        text: "continue_with",
-        width: 280,
-      });
-    };
-
-    if (window.google) {
-      render();
-      return;
-    }
-
-    const script = document.createElement("script");
-    script.src = "https://accounts.google.com/gsi/client";
-    script.async = true;
-    script.defer = true;
-    script.onload = render;
-    document.head.appendChild(script);
-  }, [onSignIn, setError]);
-
-  const demoSignIn = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await onSignIn("dev:skylar@example.com");
-    } catch (err) {
-      setError(messageForError(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <main className="signin">
-      <div className="signin-panel">
-        <div className="signin-mark">
-          <Box size={28} />
-        </div>
-        <h1>GLB to Floorplan</h1>
-        <p>Import a 3D scan and export a measured floorplan PDF.</p>
-        {GOOGLE_CLIENT_ID ? (
-          <div className="google-button" ref={googleButtonRef} />
-        ) : (
-          <button className="primary wide" type="button" onClick={demoSignIn}>
-            {busy ? <LoaderCircle className="spin" size={18} /> : <User size={18} />}
-            Continue as demo
-          </button>
-        )}
-        {error && (
-          <div className="signin-error">
-            <AlertCircle size={17} />
-            <span>{error}</span>
-          </div>
-        )}
-      </div>
-    </main>
-  );
-}
-
 function WorkflowRail({
   currentStep,
   active,
   job,
   floorplans,
   onPick,
-  token,
 }: {
   currentStep: number;
   active: FloorplanSummary | null;
   job: JobSnapshot | null;
   floorplans: FloorplanSummary[];
   onPick: (floorplan: FloorplanSummary) => void;
-  token: string;
 }) {
   return (
     <aside className="workflow-rail">
-      <StepHeader step={1} active={currentStep === 1} title="Upload your GLB file">
+      <StepHeader step={1} active={currentStep === 1} title="Upload your model">
         <p>
           We'll analyze your 3D model and convert it into a measured floorplan
           with rooms, doors, windows, and furniture detected.
         </p>
-        <span className="support-note">Supports .glb / .gltf files up to 250MB</span>
+        <span className="support-note">Supports .glb, .gltf, or .zip files up to 250MB</span>
       </StepHeader>
 
       <StepHeader step={2} active={currentStep === 2} title="Processing your model">
@@ -379,18 +219,14 @@ function WorkflowRail({
       </StepHeader>
 
       <StepHeader step={3} active={currentStep === 3} title="Your floorplan is ready">
-        <p>Review, then download or share your measured floorplan.</p>
+        <p>Review, then download your measured floorplan.</p>
         {active?.status === "complete" && (
-          <a
-            className="primary export"
-            href={withToken(active.pdf_url, token)}
-            download
-          >
+          <a className="primary export" href={apiUrl(active.pdf_url)} download>
             <Download size={18} />
-            Share / Export PDF
+            Export PDF
           </a>
         )}
-        <SavedList items={floorplans} onPick={onPick} />
+        <RecentList items={floorplans} onPick={onPick} />
       </StepHeader>
     </aside>
   );
@@ -453,7 +289,7 @@ function UploadDropZone({
       >
         <FileArchive size={54} />
         <strong>No file selected</strong>
-        <span>Drag & drop your GLB file here</span>
+        <span>Drag & drop your GLB, GLTF, or ZIP file here</span>
         <button
           className="primary"
           type="button"
@@ -470,7 +306,7 @@ function UploadDropZone({
         <input
           ref={fileInputRef}
           type="file"
-          accept=".glb,.gltf,model/gltf-binary,model/gltf+json"
+          accept=".glb,.gltf,.zip,model/gltf-binary,model/gltf+json,application/zip"
           onChange={(event) => {
             const file = event.target.files?.[0];
             if (file) onFile(file);
@@ -496,14 +332,8 @@ function ProcessingView({ job, title }: { job: JobSnapshot | null; title: string
   );
 }
 
-function ResultView({
-  floorplan,
-  token,
-}: {
-  floorplan: FloorplanSummary;
-  token: string;
-}) {
-  const svgSrc = withToken(floorplan.svg_url, token);
+function ResultView({ floorplan }: { floorplan: FloorplanSummary }) {
+  const svgSrc = apiUrl(floorplan.svg_url);
   return (
     <div className="result-view">
       <div className="sheet-toolbar">
@@ -515,9 +345,9 @@ function ResultView({
               : "Measured floorplan"}
           </span>
         </div>
-        <a className="primary" href={withToken(floorplan.pdf_url, token)} download>
+        <a className="primary" href={apiUrl(floorplan.pdf_url)} download>
           <Download size={18} />
-          Share / Export PDF
+          Export PDF
         </a>
       </div>
       <div className="paper-sheet">
@@ -572,26 +402,25 @@ function ProgressList({ job }: { job: JobSnapshot | null }) {
   );
 }
 
-function SavedList({
+function RecentList({
   items,
   onPick,
 }: {
   items: FloorplanSummary[];
   onPick: (floorplan: FloorplanSummary) => void;
 }) {
-  const saved = items.slice(0, 5);
-  if (saved.length === 0) {
+  if (items.length === 0) {
     return (
-      <div className="saved-empty">
+      <div className="recent-empty">
         <FileText size={18} />
-        <span>Your saved floorplans will appear here.</span>
+        <span>Recent conversions will appear here until the server restarts.</span>
       </div>
     );
   }
 
   return (
-    <div className="saved-list">
-      {saved.map((item) => (
+    <div className="recent-list">
+      {items.map((item) => (
         <button key={item.id} type="button" onClick={() => onPick(item)}>
           <FileText size={19} />
           <span>
@@ -606,18 +435,15 @@ function SavedList({
 }
 
 async function pollFloorplan(
-  token: string,
   id: string,
   setActive: (floorplan: FloorplanSummary) => void,
   setJob: (job: JobSnapshot | null) => void,
-  refreshAccount: (token: string) => Promise<void>,
 ) {
   for (let attempt = 0; attempt < 90; attempt += 1) {
-    const detail = await getFloorplan(token, id);
+    const detail = await getFloorplan(id);
     setActive(detail.floorplan);
     setJob(detail.job ?? null);
     if (detail.floorplan.status === "complete" || detail.floorplan.status === "failed") {
-      await refreshAccount(token);
       return;
     }
     await new Promise((resolve) => window.setTimeout(resolve, 1000));

@@ -1,26 +1,31 @@
-mod auth;
 mod config;
 mod error;
 mod models;
 mod processing;
 mod routes;
-mod storage;
 
-use std::sync::Arc;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::Router;
+use chrono::NaiveDate;
 use config::AppConfig;
-use sqlx::postgres::PgPoolOptions;
-use storage::ArtifactStore;
+use models::FloorplanRecord;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
-    pub pool: sqlx::PgPool,
-    pub store: ArtifactStore,
-    pub http: reqwest::Client,
+    pub jobs: Arc<RwLock<HashMap<Uuid, FloorplanRecord>>>,
+    pub usage: Arc<Mutex<HashMap<String, DailyUsage>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DailyUsage {
+    pub day: NaiveDate,
+    pub used: i64,
 }
 
 #[tokio::main]
@@ -36,19 +41,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Arc::new(AppConfig::from_env()?);
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&config.database_url)
-        .await?;
-
-    sqlx::migrate!("./migrations").run(&pool).await?;
-
-    let store = ArtifactStore::new(config.artifact_dir.clone()).await?;
     let state = AppState {
         config: config.clone(),
-        pool,
-        store,
-        http: reqwest::Client::new(),
+        jobs: Arc::new(RwLock::new(HashMap::new())),
+        usage: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let cors = config.cors_layer()?;
@@ -58,7 +54,11 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!("backend listening on http://{}", config.bind_addr);
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

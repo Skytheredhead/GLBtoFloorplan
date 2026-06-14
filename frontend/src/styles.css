@@ -63,10 +63,6 @@ a {
   background: #242a32;
 }
 
-.nav-item.signout {
-  margin-top: auto;
-}
-
 .workspace {
   min-width: 0;
   display: flex;
@@ -103,8 +99,7 @@ a {
   color: #075ee5;
 }
 
-.icon-button,
-.avatar {
+.icon-button {
   border: 1px solid #d6d9de;
   background: #fff;
   color: #2b3038;
@@ -114,13 +109,6 @@ a {
   display: grid;
   place-items: center;
   cursor: pointer;
-}
-
-.avatar {
-  border: 0;
-  background: #25272d;
-  color: #fff;
-  font-weight: 700;
 }
 
 .error-banner {
@@ -420,13 +408,13 @@ a {
   border-bottom: 0;
 }
 
-.saved-list {
+.recent-list {
   display: grid;
   gap: 8px;
 }
 
-.saved-list button,
-.saved-empty {
+.recent-list button,
+.recent-empty {
   width: 100%;
   border: 1px solid #e0e4e8;
   background: #fbfbfc;
@@ -439,26 +427,26 @@ a {
   text-align: left;
 }
 
-.saved-list button {
+.recent-list button {
   cursor: pointer;
 }
 
-.saved-list span {
+.recent-list span {
   min-width: 0;
   flex: 1;
   display: grid;
   gap: 3px;
 }
 
-.saved-list strong {
+.recent-list strong {
   font-size: 13px;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
 
-.saved-list small,
-.saved-empty {
+.recent-list small,
+.recent-empty {
   color: #6b7280;
   font-size: 12px;
 }
@@ -470,56 +458,6 @@ a {
 
 .failed-view p {
   max-width: 520px;
-}
-
-.signin {
-  min-height: 100vh;
-  display: grid;
-  place-items: center;
-  background: #e7e8e7;
-  padding: 20px;
-}
-
-.signin-panel {
-  width: min(390px, 100%);
-  background: #fff;
-  border: 1px solid #dfe3e7;
-  border-radius: 8px;
-  padding: 32px;
-  box-shadow: 0 18px 60px rgba(15, 23, 42, 0.09);
-}
-
-.signin-mark {
-  width: 56px;
-  height: 56px;
-  border-radius: 7px;
-  display: grid;
-  place-items: center;
-  background: #111419;
-  color: #fff;
-}
-
-.signin h1 {
-  font-size: 28px;
-  margin: 22px 0 8px;
-}
-
-.signin p {
-  margin: 0 0 22px;
-  color: #4b5563;
-  line-height: 1.5;
-}
-
-.signin-error {
-  margin-top: 16px;
-  display: flex;
-  gap: 8px;
-  color: #991b1b;
-  font-size: 13px;
-}
-
-.google-button {
-  min-height: 42px;
 }
 
 @keyframes spin {

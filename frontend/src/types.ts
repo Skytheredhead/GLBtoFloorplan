@@ -1,27 +1,9 @@
-export interface PublicUser {
-  id: string;
-  email: string;
-  name?: string;
-  picture_url?: string;
-}
-
 export interface Quota {
-  monthly_limit: number;
+  daily_limit: number;
   used: number;
   remaining: number;
-  month_start: string;
+  day: string;
   reset_at: string;
-}
-
-export interface AuthResponse {
-  token: string;
-  user: PublicUser;
-  quota: Quota;
-}
-
-export interface MeResponse {
-  user: PublicUser;
-  quota: Quota;
 }
 
 export interface FloorplanSummary {
@@ -51,6 +33,7 @@ export interface JobSnapshot {
 export interface UploadResponse {
   floorplan: FloorplanSummary;
   job: JobSnapshot;
+  quota: Quota;
 }
 
 export interface FloorplanDetail {
